@@ -1,0 +1,13 @@
+PyQt5
+requests
+PyQtWebEngine
+markdown
+pyqt5-tools
+llama-cpp-python
+transformers
+bitsandbytes
+langdetect
+accelerate
+llama-cpp-python[server]
+langdetect
+flash-attn
