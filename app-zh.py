@@ -23,9 +23,19 @@ from pathlib import Path
 from PyQt5.QtWidgets import QCheckBox
 from PyQt5.QtWebChannel import QWebChannel
 from PyQt5.QtWebEngineWidgets import QWebEnginePage
-from PyQt5.QtCore import QProcessEnvironment  # Ensure import
+from PyQt5.QtCore import QProcessEnvironment  
 from PyQt5.QtWidgets import QLayout, QSizePolicy
 from PyQt5.QtCore import QSize, QRect, QPoint
+import sounddevice as sd
+from scipy.io.wavfile import write
+import requests
+from tempfile import NamedTemporaryFile
+import json
+import numpy as np
+from scipy.io.wavfile import write
+import requests
+import noisereduce as nr
+import librosa
 
 # ====================== 前置配置 ======================
 import warnings
@@ -45,27 +55,53 @@ def resource_path(relative_path):
 APP_NAME = "AIToolkitPro"
 APP_VERSION = "1.0.0"
 MAX_CONCURRENT = 3
-BORDER_WIDTH = 5  # 窗口边框宽度
+BORDER_WIDTH = 5 
 MODEL_EXTENSIONS = ('.safetensors', '.bin', '.pth', '.pt', '.gguf')
 APP_ICON_PATH = resource_path("assets/icons/icon.ico") 
 user_prefix = "User: "
 model_prefix = "Firefly: "
+raw_audio_path = "./audio/recorded_audio.wav"
+denoised_audio_path = "./audio/denoised_audio.wav"
+
+# ====================== 全局函数类 ======================
+def call_stt_api(audio_path, api_endpoint="http://127.0.0.1:8000/transcribe"):
+    """
+    调用 STT API 进行语音转文本
+    :param audio_path: 音频文件路径
+    :param api_endpoint: API 端点地址
+    :return: 转录的文本或错误信息
+    """
+    try:
+        with open(audio_path, "rb") as audio_file:
+            response = requests.post(
+                api_endpoint,
+                files={"file": (os.path.basename(audio_path), audio_file, "audio/wav")},
+                timeout=20
+            )
+        response.raise_for_status()
+        # 确认 API 返回了正确的 JSON 数据
+        return response.json().get("text", "无返回文本")
+    except requests.exceptions.RequestException as e:
+        return f"API_ERROR: {str(e)}"
+    except Exception as e:
+        return f"ERROR: {str(e)}"
 
 # ====================== 配置管理类 ======================
 class ConfigManager:
     _instance = None
     
     def __init__(self):
-        self.settings = QSettings("MyCompany", "AIToolkitPro")
+        self.settings = QSettings("Rilance", "RIL")
         self.dark_mode = False
         self.proxy = {"http": "", "https": ""}
-        self.model_path = os.path.abspath("models")
+        self.model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
         self.font_size = 12
         self.download_history = []
         self.terminal_type = "cmd"
-        self.load_settings()
         self.font_family = "Microsoft Yahei"
         self.font_size = 12
+        self.stt_mode = "api"
+        self.api_endpoint = "http://127.0.0.1:8000/transcribe" 
         self.load_settings()
 
     @classmethod
@@ -84,6 +120,8 @@ class ConfigManager:
         self.terminal_type = self.settings.value("terminal_type", "cmd")
         self.font_family = self.settings.value("font_family", "Microsoft Yahei")
         self.font_size = self.settings.value("font_size", 12, type=int)
+        self.stt_mode = self.settings.value("stt_mode", "api")
+        self.api_endpoint = self.settings.value("api_endpoint", "http://127.0.0.1:8000/transcribe")
 
     def save_settings(self):
         self.settings.setValue("dark_mode", self.dark_mode)
@@ -95,6 +133,8 @@ class ConfigManager:
         self.settings.setValue("terminal_type", self.terminal_type)
         self.settings.setValue("font_family", self.font_family)
         self.settings.setValue("font_size", self.font_size)
+        self.settings.setValue("stt_mode", self.stt_mode)
+        self.settings.setValue("api_endpoint", self.api_endpoint)
 
 # ====================== 首页组件 ======================
 class HomePage(QWidget):
@@ -135,20 +175,33 @@ class HomePage(QWidget):
 
 # ====================== 对话页面 ======================
 class ChatPage(QWidget):
+    user_prefix = "User: "
+    model_prefix = "Firefly: "
+
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.model_process = None  # 模型加载进程
+        self.record_btn = None
         self.init_ui()
         self.scan_local_models()
         self.output_buffer = ""
         self.output_timer = QTimer()
         self.output_timer.timeout.connect(self.flush_buffer)
         self.current_message = ""
+        self.is_recording = False
+
+        self.stream = None  # 显式初始化
+        self.audio_frames = []
+        self.sample_rate = 16000
 
     def init_ui(self):
+        if self.layout() is not None:
+            QWidget().setLayout(self.layout()) 
         main_layout = QVBoxLayout()
         main_layout.setContentsMargins(10, 10, 10, 10)
+        self.record_btn = QPushButton()
+        self.record_btn.setVisible(False)
 
         # 顶部控制栏
         control_layout = QHBoxLayout()
@@ -202,6 +255,25 @@ class ChatPage(QWidget):
         self.user_input.returnPressed.connect(self.send_message)
         send_btn = QPushButton("发送")
         send_btn.clicked.connect(self.send_message)
+        self.record_btn = QPushButton() 
+        self.record_btn.setIcon(QIcon(resource_path("assets/icons/mic.png")))
+        self.record_btn.setCheckable(True)
+        self.record_btn.clicked.connect(self.toggle_recording)
+        self.record_btn.setStyleSheet("""
+            QPushButton { 
+                padding: 5px;
+                border: none;
+                background: transparent;
+            }
+            QPushButton:checked {
+                background: #ff0000;
+                border-radius: 8px;
+            }
+        """)
+        
+        input_layout.addWidget(self.record_btn)
+
+        self.setLayout(main_layout)
         
         input_layout.addWidget(self.user_input, 4)
         input_layout.addWidget(send_btn, 1)
@@ -211,29 +283,28 @@ class ChatPage(QWidget):
 
     def scan_local_models(self):
         self.model_combo.clear()
-        model_dir = Path(self.config.model_path)
+        model_dir = Path(self.config.model_path) 
         
         if not model_dir.exists():
-            QMessageBox.warning(self, "警告", "模型目录不存在！")
+            QMessageBox.warning(self, "警告", "模型目录不存在！已自动创建。")
+            try:
+                model_dir.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                QMessageBox.critical(self, "错误", f"创建目录失败: {str(e)}")
             return
 
-        # 支持的文件扩展名
         model_exts = ('.safetensors', '.bin', '.pth', '.pt', '.gguf')
         valid_models = []
 
-        # 扫描目录
         for entry in model_dir.iterdir():
-            # 处理GGUF单文件
             if entry.is_file() and entry.suffix.lower() == '.gguf':
-                valid_models.append(entry.stem)  # 去除扩展名
-            # 处理模型目录
+                valid_models.append(entry.stem) 
             elif entry.is_dir():
                 has_config = (entry / 'config.json').exists()
                 has_model_file = any(f.suffix in model_exts for f in entry.iterdir())
                 if has_config or has_model_file:
                     valid_models.append(entry.name)
 
-        # 去重排序
         valid_models = sorted(list(set(valid_models)))
         
         if not valid_models:
@@ -249,10 +320,7 @@ class ChatPage(QWidget):
         if not model_name:
             return
 
-        # 获取虚拟环境Python路径
         venv_python = VirtualEnvManager.get_python_path()
-
-        # 获取完整的虚拟环境环境变量
         process_env = VirtualEnvManager.get_env_with_venv()
         
         # 构建模型路径
@@ -292,7 +360,7 @@ class ChatPage(QWidget):
 
     def handle_initial_output(self):
         data = self.model_process.readAllStandardOutput().data().decode()
-        if "MODEL_READY" in data:  # 检测新的初始化标志
+        if "MODEL_READY" in data: 
             self.append_message("[系统] 模型已就绪，可以开始对话", is_system=True)
             self.model_process.readyReadStandardOutput.disconnect(self.handle_initial_output)
 
@@ -305,7 +373,6 @@ class ChatPage(QWidget):
         if not question:
             return
 
-        # 发送问题到模型进程
         self.model_process.write(f"{question}\n".encode())
         self.append_message(f"User: {question}")
         self.user_input.clear()
@@ -315,7 +382,7 @@ class ChatPage(QWidget):
         if data:
             self.output_buffer += data
             if not self.output_timer.isActive():
-                self.output_timer.start(50)  # 50ms刷新一次
+                self.output_timer.start(50) 
 
     def handle_error(self):
         err = self.model_process.readAllStandardError().data().decode()
@@ -331,13 +398,12 @@ class ChatPage(QWidget):
         cursor = self.chat_history.textCursor()
         cursor.movePosition(QTextCursor.End)
         
-        if is_system:  # 系统消息特殊处理
-        # 使用灰色显示系统消息（保留原有异色方案）
+        if is_system:  
             cursor.insertHtml(f'<span style="color:#666;">{message}</span><br>')
         else:
             # 用户消息处理
             if message.startswith(user_prefix):
-                clean_msg = message[len(user_prefix):].lstrip()  # 移除可能重复的前缀
+                clean_msg = message[len(user_prefix):].lstrip() 
                 cursor.insertText(f"{user_prefix}{clean_msg}\n")
             # 模型消息处理
             elif message.startswith(model_prefix):
@@ -363,9 +429,154 @@ class ChatPage(QWidget):
             # 替换原有内容
             cursor.removeSelectedText()
             cursor.insertText(f"Firefly: {self.current_message}")
-        
-            # 自动滚动
             self.chat_history.ensureCursorVisible()
+
+    def toggle_recording(self):
+        if self.record_btn.isChecked():
+            self.start_recording()
+        else:
+            self.stop_recording()
+
+    def start_recording(self):
+        try:
+            self.is_recording = True
+            self.audio_frames = []
+            
+            def callback(indata, frames, time, status):
+                if self.is_recording:
+                    self.audio_frames.append(indata.copy())
+
+            self.stream = sd.InputStream(
+                samplerate=self.sample_rate,
+                channels=1,
+                callback=callback
+            )
+            self.stream.start()
+        except Exception as e:
+            self.is_recording = False
+            self.record_btn.setChecked(False)
+            QMessageBox.critical(self, "录音错误", f"无法启动录音设备: {str(e)}")
+
+    def stop_recording(self):
+        self.is_recording = False
+        try:
+            if self.stream is not None:
+                self.stream.stop()
+                self.stream.close()
+                self.stream = None
+        except Exception as e:
+            QMessageBox.warning(self, "录音错误", f"停止录音失败: {str(e)}")
+            self.record_btn.setChecked(False)
+            return
+
+        if not self.audio_frames:
+            self.record_btn.setChecked(False) 
+            return
+        
+        output_dir = "./audio"
+        os.makedirs(output_dir, exist_ok=True)
+        raw_audio_path = os.path.join(output_dir, "recorded_audio.wav")
+        denoised_audio_path = os.path.join(output_dir, "denoised_audio.wav")
+
+        try:
+            # 拼接录音帧并保存原始音频文件
+            audio_data = np.concatenate(self.audio_frames, axis=0)
+            write(raw_audio_path, self.sample_rate, audio_data.astype(np.int16))
+
+            # 加载音频并应用降噪
+            reduced_audio = self.apply_noise_reduction(raw_audio_path)
+            denoised_file_path = os.path.join(output_dir, "denoised_audio.wav")
+            write(denoised_file_path, self.sample_rate, reduced_audio.astype(np.int16))
+
+            # 调用 STT API，使用降噪后的音频文件
+            transcribed_text = call_stt_api(denoised_audio_path)
+            self.user_input.setText(transcribed_text)
+        except Exception as e:
+            QMessageBox.warning(self, "处理错误", f"音频处理失败: {str(e)}")
+            self.record_btn.setChecked(False)
+
+        try:
+            if os.path.exists(raw_audio_path):
+                os.remove(raw_audio_path)
+            if os.path.exists(denoised_audio_path):
+                os.remove(denoised_audio_path)
+            QMessageBox.information(None, "清理完成", "临时音频文件已删除。")
+        except Exception as e:
+            QMessageBox.critical(
+                None, 
+                "清理错误",  
+                f"清理过程中出现异常: {str(e)}" 
+            )
+    
+    def transcribe_api(self, filename):
+        try:
+            process = subprocess.Popen(
+                ["python", "stt_api_client.py", 
+                 "--mode", "api",
+                 "--audio", filename,
+                 "--api-endpoint", f"{self.config.api_endpoint}"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            stdout, stderr = process.communicate(timeout=20)
+        
+            if process.returncode != 0:
+                err_msg = stderr.decode().strip() or "API请求失败"
+                return f"API错误: {err_msg}"
+            
+            return stdout.decode().strip()
+        
+        except subprocess.TimeoutExpired:
+            process.kill()
+            return "API请求超时"
+        except Exception as e:
+            return f"API调用错误: {str(e)}"
+        
+    def transcribe_audio(self, filename):
+        """根据配置选择转录模式"""
+        if self.config.stt_mode == "local":
+            return self.transcribe_local(filename)
+        else:
+            return self.transcribe_api(filename)
+        
+    def apply_noise_reduction(self, audio_path):
+        """
+        加载音频文件并进行降噪处理。
+        
+        Args:
+            file_path (str): 输入的音频文件路径。
+        
+        Returns:
+            np.ndarray: 降噪后的音频数据。
+        """
+        
+        audio, rate = librosa.load(audio_path, sr=self.sample_rate)
+        epsilon = 1e-8  # 根据实际效果调整
+        audio += epsilon * np.random.randn(len(audio))
+
+        try:
+            # 加载音频文件
+            audio_data, sr = librosa.load(audio_path, sr=self.sample_rate)
+        
+            # 计算背景噪声 (取音频前 1 秒作为噪声样本)
+            noise_sample = audio_data[:sr]
+        
+            # 应用降噪
+            reduced_audio = nr.reduce_noise(
+                y=audio_data, 
+                sr=sr, 
+                y_noise=noise_sample,
+                stationary=False,
+                n_fft=2048,
+                win_length=1024,
+                n_std_thresh=2,
+                verbose=False,
+                n_std_thresh_stationary=1.5 
+            )
+            return reduced_audio
+        except Exception as e:
+            QMessageBox.warning(self, "降噪错误", f"无法完成降噪处理: {str(e)}")
+            return np.zeros(1) 
 
 # ====================== 虚拟环境管理器 ======================
 class VirtualEnvManager:
@@ -649,7 +860,10 @@ class DownloadTask(QThread):
             self.response.raise_for_status()
             
             self.total_size = int(self.response.headers.get("content-length", self.total_size))
-            save_path = os.path.join(self.config.model_path, self.file_info["rfilename"])
+            if "stt/" in self.file_info['rfilename']:  # 根据模型类型调整路径
+                save_path = os.path.join(self.config.model_path, "stt", self.file_info["rfilename"])
+            else:
+                save_path = os.path.join(self.config.model_path, self.file_info["rfilename"])
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             
             start_time = time.time()
@@ -1654,16 +1868,82 @@ class ModelDownloadPage(QWidget):
         dialog.setParent(self.window(), Qt.Dialog)
         dialog.show()
 
+#===================== 语音转文本页面 ======================
+class STTPage(QWidget):
+    def __init__(self, config, download_manager):
+        super().__init__()
+        self.config = config
+        self.download_manager = download_manager
+        self.init_ui()
+        
+    def init_ui(self):
+        layout = QVBoxLayout()
+        
+        # 模型控制栏
+        control_layout = QHBoxLayout()
+        self.model_combo = QComboBox()
+        self.gpu_check = QCheckBox("GPU加速")
+        self.load_btn = QPushButton("加载模型")
+        self.load_btn.clicked.connect(self.load_model)
+        
+        control_layout.addWidget(QLabel("选择模型:"))
+        control_layout.addWidget(self.model_combo)
+        control_layout.addWidget(self.gpu_check)
+        control_layout.addWidget(self.load_btn)
+        layout.addLayout(control_layout)
+        
+        # 日志显示
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        layout.addWidget(self.log_view)
+        
+        self.setLayout(layout)
+        self.scan_models()
+        
+    def scan_models(self):
+        self.model_combo.clear()
+        model_dir = Path(self.config.model_path) / "stt"
+        if model_dir.exists():
+            for model in model_dir.glob("*"):
+                if model.is_dir() and (model / "model.bin").exists():
+                    self.model_combo.addItem(model.name)
+
+    def load_model(self):
+        model_name = self.model_combo.currentText()
+        use_gpu = self.gpu_check.isChecked()
+        model_path = Path(self.config.model_path) / "stt" / model_name
+        
+        process = QProcess()
+        process.setProgram(sys.executable)
+        process.setArguments([
+            "stt_api.py",
+            "--model_path", str(model_path),
+            "--use_gpu" if use_gpu else "--use_cpu"
+        ])
+        
+        process.readyReadStandardOutput.connect(
+            lambda: self.log_view.appendPlainText(process.readAllStandardOutput().data().decode()))
+        process.readyReadStandardError.connect(
+            lambda: self.log_view.appendPlainText(process.readAllStandardError().data().decode()))
+            
+        process.start()
+
 # ====================== 主窗口 ======================
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        model_path = ConfigManager.instance().model_path
+        if not os.path.exists(model_path):
+            try:
+                os.makedirs(model_path, exist_ok=True)
+            except Exception as e:
+                QMessageBox.critical(self, "错误", f"无法创建模型目录: {str(e)}")
         VirtualEnvManager.get_python_path()
         self.config = ConfigManager.instance()
         self.download_manager = DownloadManager(self.config)
         self.init_ui()
         self.setWindowTitle("RIL")
-        self.setGeometry(100, 100, 1000, 600)  # 调整初始窗口大小
+        self.setGeometry(100, 100, 1000, 600) 
         self.apply_theme()
         self.settings_page.config_updated.connect(self.on_config_updated)
         self.setWindowIcon(QIcon("./assets/icons/placeholder.png"))
@@ -1673,6 +1953,8 @@ class MainWindow(QMainWindow):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window)
         self.setWindowIcon(QIcon(APP_ICON_PATH))
+        self.stt_page = STTPage(self.config, self.download_manager)
+        self.add_module("🎤 STT", self.stt_page)
 
     def init_ui(self):
         main_widget = QWidget()
@@ -1680,7 +1962,6 @@ class MainWindow(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # 自定义标题栏
         self.title_bar = QWidget()
         self.title_bar.setFixedHeight(35)
         self.title_bar.setMouseTracking(True)
@@ -1708,7 +1989,6 @@ class MainWindow(QMainWindow):
         title_bar_layout.addWidget(self.max_btn)
         title_bar_layout.addWidget(self.close_btn)
 
-        # 主内容区域
         content_widget = QWidget()
         content_layout = QHBoxLayout(content_widget)
         content_layout.setContentsMargins(0, 0, 0, 0)
@@ -1720,15 +2000,20 @@ class MainWindow(QMainWindow):
 
         self.stacked_widget = QStackedWidget()
 
+        self.toggle_btn = QPushButton("☰")
+        self.toggle_btn.setFixedSize(30, 30)
+        self.toggle_btn.clicked.connect(self.toggle_sidebar)
+        title_bar_layout.insertWidget(0, self.toggle_btn)
+
         self.home_page = HomePage(self.config)
         self.model_page = ModelDownloadPage(self.config, self.download_manager)
         self.settings_page = SettingsPage(self.config)
         self.download_page = DownloadPage(self.download_manager)
         self.command_line_page = CommandLinePage(self.config)
-        self.chat_page = ChatPage(self.config)  # 新增对话页面
+        self.chat_page = ChatPage(self.config) 
         
         self.add_module("🏠 首页", self.home_page)
-        self.add_module("💬 模型对话", self.chat_page)  # 新增对话选项
+        self.add_module("💬 模型对话", self.chat_page) 
         self.add_module("🏗️ 模型中心", self.model_page)
         self.add_module("⚙️ 系统设置", self.settings_page)
         self.add_module("⬇️ 下载管理", self.download_page)
@@ -1750,8 +2035,7 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(main_widget)
         self.update_status()
-        
-        # 添加窗口边缘调整控件
+
         self.size_grips = [
             SizeGrip(self, Qt.LeftEdge | Qt.TopEdge),
             SizeGrip(self, Qt.RightEdge | Qt.TopEdge),
@@ -1885,6 +2169,19 @@ class MainWindow(QMainWindow):
         self.theme_status.setText(f"主题: {theme}")
         self.proxy_status.setText(f"代理: {proxy}")
 
+    def toggle_sidebar(self):
+        if self.nav_list.width() > 50:
+            self.nav_list.setFixedWidth(50)
+            for i in range(self.nav_list.count()):
+                item = self.nav_list.item(i)
+                item.setText("")
+        else:
+            self.nav_list.setFixedWidth(200)
+            texts = ["🏠", "💬", "🏗️", "⚙️", "⬇️", "💻", "🎤", "🔊"]  # 原文本简化为图标
+            for i in range(self.nav_list.count()):
+                item = self.nav_list.item(i)
+                item.setText(texts[i])
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
@@ -2016,7 +2313,7 @@ class SizeGrip(QWidget):
             self.setCursor(Qt.ArrowCursor)
 
     def paintEvent(self, event):
-        pass  # 无需绘制内容，仅用于交互
+        pass 
 
 # ====================== 程序入口 ======================
 if __name__ == "__main__":

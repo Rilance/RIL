@@ -56,10 +56,10 @@ class ConfigManager:
     _instance = None
     
     def __init__(self):
-        self.settings = QSettings("MyCompany", "AIToolkitPro")
+        self.settings = QSettings("Rilance", "RIL")
         self.dark_mode = False
         self.proxy = {"http": "", "https": ""}
-        self.model_path = os.path.abspath("models")
+        self.model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
         self.font_size = 12
         self.download_history = []
         self.terminal_type = "cmd"
@@ -214,7 +214,11 @@ class ChatPage(QWidget):
         model_dir = Path(self.config.model_path)
         
         if not model_dir.exists():
-            QMessageBox.warning(self, "Warning", "Model directory not found!")
+            QMessageBox.warning(self, "Warning", "Model directory does not exist! Attempting to create automatically.")
+            try:
+                model_dir.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to create directory: {str(e)}")
             return
 
         # Supported file extensions
@@ -1705,6 +1709,12 @@ class ModelDownloadPage(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        model_path = ConfigManager.instance().model_path
+        if not os.path.exists(model_path):
+            try:
+                os.makedirs(model_path, exist_ok=True)
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Cannot create model directory: {str(e)}")
         VirtualEnvManager.get_python_path()
         self.config = ConfigManager.instance()
         self.download_manager = DownloadManager(self.config)

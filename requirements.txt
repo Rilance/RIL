@@ -11,3 +11,12 @@ accelerate
 llama-cpp-python[server]
 langdetect
 flash-attn
+sounddevice
+scipy
+uvicorn
+fastapi
+python-multipart
+protobuf
+noisereduce
+librosa
+faster_whisper
