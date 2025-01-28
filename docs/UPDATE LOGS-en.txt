@@ -1,0 +1,6 @@
+V0.1: Initial commit
+V0.2:
+Fixes:
+1.Updated the model folder to recognize relative paths
+Updates:
+1.Added speech-to-text functionality
