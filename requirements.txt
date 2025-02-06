@@ -20,3 +20,12 @@ protobuf
 noisereduce
 librosa
 faster_whisper
+pydub
+dash
+PyPDF2
+python-docx
+sentence-transformers 
+faiss-cpu
+fitz
+pymupdf
+TTS

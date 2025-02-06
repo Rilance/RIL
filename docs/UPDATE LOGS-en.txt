@@ -1,6 +1,15 @@
-V0.1: Initial commit
+V0.1: Initial Submission
+
 V0.2:
-Fixes:
-1.Updated the model folder to recognize relative paths
-Updates:
-1.Added speech-to-text functionality
+Fixes:  
+1.Updated the model folder to use relative path recognition.
+Updates:  
+1.Added support for speech-to-text
+(Verified that the Faster Whisper Large V3 model is usable)
+
+V0.3:
+Updates:  
+1.Added content to the knowledge base, allowing for custom data and information (excluding character settings from large language models).  
+2.Added Text-to-Speech (TTS) functionality (not perfect).  
+3.Enhanced logical relationships in model placement.
+

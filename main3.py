@@ -1,33 +1,56 @@
-# ====================== Import Dependencies ======================
+# ====================== 导入依赖 ===================
 import os
 import sys
-import markdown
-import requests
+import json
 import shutil
 import time
 import subprocess
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSettings, QUrl, QObject, QSize, QProcess, QPoint, QFileInfo, QRect, QRectF, QTimer
+import sqlite3
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+import platform
+from pathlib import Path
+
+import markdown
+import requests
+import numpy as np
+import sounddevice as sd
+import noisereduce as nr
+import librosa
+from scipy.io.wavfile import write
+from pydub import AudioSegment
+from pydub.playback import play
+
+# QtCore
+from PyQt5.QtCore import (
+    Qt, QThread, pyqtSignal, QSettings, QUrl, QObject, QSize,
+    QProcess, QPoint, QFileInfo, QRect, QRectF, QTimer, QProcessEnvironment
+)
+
+# QtWidgets
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QListWidget, QStackedWidget,
     QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton, QLabel,
-    QListWidgetItem, QMessageBox, QSpinBox, QFileDialog,
-    QFormLayout, QGroupBox, QTabWidget, QButtonGroup, QComboBox,
-    QDialog, QProgressBar, QPlainTextEdit, QTabBar, QSizeGrip, QScrollArea
+    QListWidgetItem, QMessageBox, QSpinBox, QFileDialog, QFormLayout,
+    QGroupBox, QTabWidget, QButtonGroup, QComboBox, QDialog, QProgressBar,
+    QPlainTextEdit, QTabBar, QSizeGrip, QScrollArea, QStyle, QCheckBox,
+    QLayout, QSizePolicy, QTreeWidget, QTreeWidgetItem, QInputDialog
 )
-from PyQt5.QtWidgets import QStyle
-from PyQt5.QtGui import (QColor, QPalette, QFont, QDesktopServices, 
-                        QTextCursor, QCursor, QIcon, QPainter, QBrush, 
-                        QPen, QPainterPath)
-from PyQt5.QtWebEngineWidgets import QWebEngineView
-from pathlib import Path
-from PyQt5.QtWidgets import QCheckBox
-from PyQt5.QtWebChannel import QWebChannel
-from PyQt5.QtWebEngineWidgets import QWebEnginePage
-from PyQt5.QtCore import QProcessEnvironment  # Ensure import
-from PyQt5.QtWidgets import QLayout, QSizePolicy
-from PyQt5.QtCore import QSize, QRect, QPoint
 
-# ====================== Pre-configuration ======================
+# QtGui
+from PyQt5.QtGui import (
+    QColor, QPalette, QFont, QDesktopServices, QTextCursor,
+    QCursor, QIcon, QPainter, QBrush, QPen, QPainterPath
+)
+
+# QtWebEngineWidgets
+from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage
+
+# QtWebChannel
+from PyQt5.QtWebChannel import QWebChannel
+
+
+# ====================== 前置配置 ======================
 import warnings
 warnings.filterwarnings(
     "ignore",
@@ -35,23 +58,67 @@ warnings.filterwarnings(
     message=r"sipPyTypeDict\(\) is deprecated.*",
 )
 
-# Get absolute resource path
+# 获取资源绝对路径
 def resource_path(relative_path):
-    """ Get absolute path to resource """
+    """ 获取资源的绝对路径 """
     base_path = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base_path, relative_path)
 
-# ====================== Constant Definitions ======================
+# ====================== 常量定义 ======================
 APP_NAME = "RIL"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 MAX_CONCURRENT = 3
-BORDER_WIDTH = 5  # Window border width
+BORDER_WIDTH = 5 
 MODEL_EXTENSIONS = ('.safetensors', '.bin', '.pth', '.pt', '.gguf')
 APP_ICON_PATH = resource_path("assets/icons/icon.ico") 
 user_prefix = "User: "
-model_prefix = "Firefly: "
+model_prefix = "Reverie: "
+raw_audio_path = "./audio/recorded_audio.wav"
+denoised_audio_path = "./audio/denoised_audio.wav"
 
-# ====================== Configuration Manager Class ======================
+# ====================== 创建路径 ======================
+def create_knowledge_directory(path):
+    if not os.path.exists(path):
+        os.makedirs(path)
+
+def create_models_folders():
+    root_dir = os.path.abspath(os.getcwd()) 
+    models_dir = os.path.join(root_dir, "models")
+
+    if not os.path.exists(models_dir):
+        os.makedirs(models_dir) 
+        print(f"Created directory: {models_dir}")
+
+    for sub_dir in ["stt", "llm", "tts"]:
+        sub_dir_path = os.path.join(models_dir, sub_dir)
+        if not os.path.exists(sub_dir_path):
+            os.makedirs(sub_dir_path)
+            print(f"Created directory: {sub_dir_path}")
+
+# ====================== 全局函数类 ======================
+def call_stt_api(audio_path, api_endpoint="http://127.0.0.1:8000/transcribe"):
+    """
+    调用 STT API 进行语音转文本
+    :param audio_path: 音频文件路径
+    :param api_endpoint: API 端点地址
+    :return: 转录的文本或错误信息
+    """
+    try:
+        with open(audio_path, "rb") as audio_file:
+            response = requests.post(
+                api_endpoint,
+                files={"file": (os.path.basename(audio_path), audio_file, "audio/wav")},
+                timeout=20
+            )
+        response.raise_for_status()
+        # 确认 API 返回了正确的 JSON 数据
+        return response.json().get("text", "无返回文本")
+    except requests.exceptions.RequestException as e:
+        return f"API_ERROR: {str(e)}"
+    except Exception as e:
+        return f"ERROR: {str(e)}"
+    
+# ====================== 配置管理类 ======================
 class ConfigManager:
     _instance = None
     
@@ -63,9 +130,16 @@ class ConfigManager:
         self.font_size = 12
         self.download_history = []
         self.terminal_type = "cmd"
-        self.load_settings()
         self.font_family = "Microsoft Yahei"
         self.font_size = 12
+        self.stt_mode = "api"
+        self.api_endpoint = "http://127.0.0.1:8000/transcribe" 
+        self.tts_enabled = self.settings.value("tts_enabled", False, type=bool)
+        self.tts_model_type = self.settings.value("tts_model_type", "SoVITS", type=str)
+        self.sovits_path = os.path.abspath("./SoVITS_weights")
+        self.gpt_path = os.path.abspath("./GPT_weights")
+        self.ref_audio_path = None  
+        self.knowledge_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "knowledge")  # 新增知识库路径
         self.load_settings()
 
     @classmethod
@@ -84,6 +158,11 @@ class ConfigManager:
         self.terminal_type = self.settings.value("terminal_type", "cmd")
         self.font_family = self.settings.value("font_family", "Microsoft Yahei")
         self.font_size = self.settings.value("font_size", 12, type=int)
+        self.stt_mode = self.settings.value("stt_mode", "api")
+        self.api_endpoint = self.settings.value("api_endpoint", "http://127.0.0.1:8000/transcribe")
+        self.tts_enabled = self.settings.value("tts_enabled", False, type=bool)
+        self.tts_model_type = self.settings.value("tts_model_type", "SoVITS")
+        self.knowledge_path = self.settings.value("knowledge_path", self.knowledge_path)  # 新增
 
     def save_settings(self):
         self.settings.setValue("dark_mode", self.dark_mode)
@@ -95,8 +174,13 @@ class ConfigManager:
         self.settings.setValue("terminal_type", self.terminal_type)
         self.settings.setValue("font_family", self.font_family)
         self.settings.setValue("font_size", self.font_size)
+        self.settings.setValue("stt_mode", self.stt_mode)
+        self.settings.setValue("api_endpoint", self.api_endpoint)
+        self.settings.setValue("tts_enabled", self.tts_enabled)
+        self.settings.setValue("tts_model_type", self.tts_model_type)
+        self.settings.setValue("knowledge_path", self.knowledge_path)  # 新增
 
-# ====================== Home Page Component ======================
+# ====================== 首页组件 ======================
 class HomePage(QWidget):
     def __init__(self, config):
         super().__init__()
@@ -107,7 +191,7 @@ class HomePage(QWidget):
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
         
-        # Background image
+        # 背景图片
         bg_path = os.path.abspath("./assets/bk/114793143.png")
         if os.path.exists(bg_path):
             self.bg_label = QLabel()
@@ -116,12 +200,12 @@ class HomePage(QWidget):
             self.bg_label.setStyleSheet("background: transparent;")
             layout.addWidget(self.bg_label)
         else:
-            error_label = QLabel("Background image not found")
+            error_label = QLabel("背景图片未找到")
             error_label.setAlignment(Qt.AlignCenter)
             layout.addWidget(error_label)
         
-        # Welcome text
-        welcome_label = QLabel("Welcome to RIL\n(Rilance Intelligence Launcher)")
+        # 欢迎文字
+        welcome_label = QLabel("欢迎来到RIL\n(Rilance Intelligence Launcher)")
         welcome_label.setAlignment(Qt.AlignCenter)
         welcome_label.setStyleSheet("""
             font-size: 28px;
@@ -133,43 +217,59 @@ class HomePage(QWidget):
         
         self.setLayout(layout)
 
-# ====================== Chat Page ======================
+# ====================== 对话页面 ======================
 class ChatPage(QWidget):
+    user_prefix = "User: "
+    model_prefix = "Reverie: "
+
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.model_process = None  # Model loading process
+        self.model_process = None  # 模型加载进程
+        self.record_btn = None
         self.init_ui()
         self.scan_local_models()
         self.output_buffer = ""
         self.output_timer = QTimer()
         self.output_timer.timeout.connect(self.flush_buffer)
         self.current_message = ""
+        self.is_recording = False
+        self.tts_page = None
+
+        self.stream = None  # 显式初始化
+        self.audio_frames = []
+        self.sample_rate = 16000
+
+        self.chat_history_data = []
 
     def init_ui(self):
+        if self.layout() is not None:
+            QWidget().setLayout(self.layout()) 
         main_layout = QVBoxLayout()
         main_layout.setContentsMargins(10, 10, 10, 10)
+        self.record_btn = QPushButton()
+        self.record_btn.setVisible(False)
 
-        # Top control bar
+        # 顶部控制栏
         control_layout = QHBoxLayout()
         
-        # Model selection dropdown
+        # 模型选择下拉框
         self.model_combo = QComboBox()
         self.model_combo.setFixedWidth(300)
         self.model_combo.setStyleSheet("QComboBox { padding: 5px; }")
         
-        # Refresh button
-        refresh_btn = QPushButton("Refresh")
+        # 刷新按钮
+        refresh_btn = QPushButton("刷新")
         refresh_btn.setIcon(QApplication.style().standardIcon(QStyle.SP_BrowserReload))
         refresh_btn.clicked.connect(self.scan_local_models)
         
-        # Load model button
-        self.load_btn = QPushButton("Load Model")
+        # 加载模型按钮
+        self.load_btn = QPushButton("加载模型")
         self.load_btn.setIcon(QIcon("./assets/icons/load.png"))
         self.load_btn.clicked.connect(self.load_model)
         self.load_btn.setEnabled(False)
 
-        # Hardware acceleration options
+        # 硬件加速选项
         self.gpu_check = QCheckBox("GPU加速")
         self.quant_check = QCheckBox("4位量化")
 
@@ -181,7 +281,7 @@ class ChatPage(QWidget):
         control_layout.addWidget(self.quant_check)
         main_layout.addLayout(control_layout)
 
-        # Chat history
+        # 对话历史
         self.chat_history = QPlainTextEdit()
         self.chat_history.setReadOnly(True)
         self.chat_history.setStyleSheet("""
@@ -195,13 +295,38 @@ class ChatPage(QWidget):
         """)
         main_layout.addWidget(self.chat_history)
 
-        # Input area
+        # 输入区域
         input_layout = QHBoxLayout()
         self.user_input = QLineEdit()
         self.user_input.setPlaceholderText("输入您的问题...")
         self.user_input.returnPressed.connect(self.send_message)
         send_btn = QPushButton("发送")
         send_btn.clicked.connect(self.send_message)
+        self.record_btn = QPushButton() 
+        self.record_btn.setIcon(QIcon(resource_path("assets/icons/mic.png")))
+        self.record_btn.setCheckable(True)
+        self.record_btn.clicked.connect(self.toggle_recording)
+        self.record_btn.setStyleSheet("""
+            QPushButton { 
+                padding: 5px;
+                border: none;
+                background: transparent;
+            }
+            QPushButton:checked {
+                background: #ff0000;
+                border-radius: 8px;
+            }
+        """)
+
+        # 导出和导入按钮
+        export_btn = QPushButton("导出对话历史")
+        export_btn.clicked.connect(self.export_chat_history)
+        import_btn = QPushButton("导入对话历史")
+        import_btn.clicked.connect(self.import_chat_history)
+        
+        input_layout.addWidget(self.record_btn)
+
+        self.setLayout(main_layout)
         
         input_layout.addWidget(self.user_input, 4)
         input_layout.addWidget(send_btn, 1)
@@ -211,7 +336,7 @@ class ChatPage(QWidget):
 
     def scan_local_models(self):
         self.model_combo.clear()
-        model_dir = Path(self.config.model_path) 
+        model_dir = Path(self.config.model_path) / 'llm'
         
         if not model_dir.exists():
             QMessageBox.warning(self, "警告", "模型目录不存在！已自动创建。")
@@ -221,23 +346,18 @@ class ChatPage(QWidget):
                 QMessageBox.critical(self, "错误", f"创建目录失败: {str(e)}")
             return
 
-        # Supported file extensions
         model_exts = ('.safetensors', '.bin', '.pth', '.pt', '.gguf')
         valid_models = []
 
-        # Scan directory
         for entry in model_dir.iterdir():
-            # Handle GGUF single files
             if entry.is_file() and entry.suffix.lower() == '.gguf':
-                valid_models.append(entry.stem)  # Remove extension
-            # Handle model directories
+                valid_models.append(entry.stem) 
             elif entry.is_dir():
                 has_config = (entry / 'config.json').exists()
                 has_model_file = any(f.suffix in model_exts for f in entry.iterdir())
                 if has_config or has_model_file:
                     valid_models.append(entry.name)
 
-        # Deduplicate and sort
         valid_models = sorted(list(set(valid_models)))
         
         if not valid_models:
@@ -247,29 +367,26 @@ class ChatPage(QWidget):
 
         self.model_combo.addItems(valid_models)
         self.load_btn.setEnabled(True)
-
+        
     def load_model(self):
         model_name = self.model_combo.currentText()
         if not model_name:
             return
 
-        # Get virtual environment Python path
         venv_python = VirtualEnvManager.get_python_path()
-
-        # Get full virtual environment variables
         process_env = VirtualEnvManager.get_env_with_venv()
         
-        # Build model path
-        base_path = Path(self.config.model_path)
+        # 构建模型路径
+        base_path = Path(self.config.model_path) / 'llm'
         model_path = base_path / model_name
         if not model_path.exists():
             model_path = model_path.with_suffix('.gguf')
 
         if not model_path.exists():
-            QMessageBox.critical(self, "Error", f"Model file not found: {model_path}")
+            QMessageBox.critical(self, "错误", f"找不到模型文件: {model_path}")
             return
 
-        # Prepare arguments
+        # 准备参数
         args = [
             "LLM.py",
             "--model_path", str(model_path)
@@ -280,13 +397,13 @@ class ChatPage(QWidget):
         if self.quant_check.isChecked():
             args.append("--load_in_4bit")
 
-        # Start process
+        # 启动进程
         self.model_process = QProcess()
-        self.model_process.setProcessEnvironment(process_env)  # Set environment variables
+        self.model_process.setProcessEnvironment(process_env)  # 设置完整环境变量
         self.model_process.start(str(venv_python), args)
         self.model_process.readyReadStandardOutput.connect(self.handle_initial_output)
         
-        # Connect signals
+        # 连接信号
         self.model_process.readyReadStandardOutput.connect(self.handle_output)
         self.model_process.readyReadStandardError.connect(self.handle_error)
         self.model_process.finished.connect(self.handle_finish)
@@ -296,7 +413,7 @@ class ChatPage(QWidget):
 
     def handle_initial_output(self):
         data = self.model_process.readAllStandardOutput().data().decode()
-        if "MODEL_READY" in data:  # 检测新的初始化标志
+        if "MODEL_READY" in data: 
             self.append_message("[系统] 模型已就绪，可以开始对话", is_system=True)
             self.model_process.readyReadStandardOutput.disconnect(self.handle_initial_output)
 
@@ -309,17 +426,65 @@ class ChatPage(QWidget):
         if not question:
             return
 
-        # 发送问题到模型进程
         self.model_process.write(f"{question}\n".encode())
-        self.append_message(f"User: {question}")
+        self.append_message(f"{self.user_prefix}{question}")
         self.user_input.clear()
+
+        # 假设模型会回复一条消息，这里需要从模型的输出中读取回复
+        # 这里假设模型的回复是通过标准输出返回的
+        self.model_process.waitForReadyRead()
+        response = self.model_process.readAllStandardOutput().data().decode().strip()
+        if response:
+            self.append_message(f"{self.model_prefix}{response}")
+            self.chat_history_data.append({"role": "model", "content": response})
+
+            if self.tts_page and self.tts_page.tts_enabled:
+                self.tts_page.generate_tts(response)
+
+    def append_message(self, message):
+        self.chat_history.appendPlainText(message)
+        if message.startswith(self.user_prefix):
+            question = message[len(self.user_prefix):]
+            self.chat_history_data.append({"role": "user", "content": question})
+
+    def export_chat_history(self):
+        history_folder = Path("./history")
+        history_folder.mkdir(parents=True, exist_ok=True)
+        timestamp = int(time.time())
+        file_path = history_folder / f"chat_history_{timestamp}.json"
+        
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(self.chat_history_data, f, ensure_ascii=False, indent=4)
+        
+        QMessageBox.information(self, "提示", f"对话历史已导出到 {file_path}")
+
+    def import_chat_history(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "选择对话历史文件", "./history", "JSON Files (*.json)")
+        if not file_path:
+            return
+        
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                chat_data = json.load(f)
+            
+            self.chat_history_data = chat_data
+            self.chat_history.clear()
+            for entry in chat_data:
+                if entry["role"] == "user":
+                    self.append_message(f"{self.user_prefix}{entry['content']}")
+                elif entry["role"] == "model":
+                    self.append_message(f"{self.model_prefix}{entry['content']}")
+            
+            QMessageBox.information(self, "提示", "对话历史已成功导入")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"导入对话历史失败: {str(e)}")
 
     def handle_output(self):
         data = self.model_process.readAllStandardOutput().data().decode(errors='ignore')
         if data:
             self.output_buffer += data
             if not self.output_timer.isActive():
-                self.output_timer.start(50)  # 50ms刷新一次
+                self.output_timer.start(50) 
 
     def handle_error(self):
         err = self.model_process.readAllStandardError().data().decode()
@@ -335,13 +500,12 @@ class ChatPage(QWidget):
         cursor = self.chat_history.textCursor()
         cursor.movePosition(QTextCursor.End)
         
-        if is_system:  # 系统消息特殊处理
-        # 使用灰色显示系统消息（保留原有异色方案）
+        if is_system:  
             cursor.insertHtml(f'<span style="color:#666;">{message}</span><br>')
         else:
             # 用户消息处理
             if message.startswith(user_prefix):
-                clean_msg = message[len(user_prefix):].lstrip()  # 移除可能重复的前缀
+                clean_msg = message[len(user_prefix):].lstrip() 
                 cursor.insertText(f"{user_prefix}{clean_msg}\n")
             # 模型消息处理
             elif message.startswith(model_prefix):
@@ -366,10 +530,170 @@ class ChatPage(QWidget):
         
             # 替换原有内容
             cursor.removeSelectedText()
-            cursor.insertText(f"Firefly: {self.current_message}")
-        
-            # 自动滚动
+            cursor.insertText(f"Reverie: {self.current_message}")
             self.chat_history.ensureCursorVisible()
+
+        if self.config.tts_enabled and self.current_message.strip():
+            self.start_tts(self.current_message)
+
+    def on_tts_finished(self, audio_path):
+        try:
+            # 使用pydub播放音频
+            audio = AudioSegment.from_wav(audio_path)
+            play(audio)
+            os.remove(audio_path)  # 清理临时文件
+        except Exception as e:
+            QMessageBox.warning(self, "播放错误", f"无法播放音频: {str(e)}")
+            
+    def on_tts_error(self, msg):
+        QMessageBox.critical(self, "TTS错误", msg)
+
+    def toggle_recording(self):
+        if self.record_btn.isChecked():
+            self.start_recording()
+        else:
+            self.stop_recording()
+
+    def start_recording(self):
+        try:
+            self.is_recording = True
+            self.audio_frames = []
+            
+            def callback(indata, frames, time, status):
+                if self.is_recording:
+                    self.audio_frames.append(indata.copy())
+
+            self.stream = sd.InputStream(
+                samplerate=self.sample_rate,
+                channels=1,
+                callback=callback
+            )
+            self.stream.start()
+        except Exception as e:
+            self.is_recording = False
+            self.record_btn.setChecked(False)
+            QMessageBox.critical(self, "录音错误", f"无法启动录音设备: {str(e)}")
+
+    def stop_recording(self):
+        self.is_recording = False
+        try:
+            if self.stream is not None:
+                self.stream.stop()
+                self.stream.close()
+                self.stream = None
+        except Exception as e:
+            QMessageBox.warning(self, "录音错误", f"停止录音失败: {str(e)}")
+            self.record_btn.setChecked(False)
+            return
+
+        if not self.audio_frames:
+            self.record_btn.setChecked(False) 
+            return
+        
+        output_dir = "./audio"
+        os.makedirs(output_dir, exist_ok=True)
+        raw_audio_path = os.path.join(output_dir, "recorded_audio.wav")
+        denoised_audio_path = os.path.join(output_dir, "denoised_audio.wav")
+
+        try:
+            # 拼接录音帧并保存原始音频文件
+            audio_data = np.concatenate(self.audio_frames, axis=0)
+            write(raw_audio_path, self.sample_rate, audio_data.astype(np.int16))
+
+            # 加载音频并应用降噪
+            reduced_audio = self.apply_noise_reduction(raw_audio_path)
+            denoised_file_path = os.path.join(output_dir, "denoised_audio.wav")
+            write(denoised_file_path, self.sample_rate, reduced_audio.astype(np.int16))
+
+            # 调用 STT API，使用降噪后的音频文件
+            transcribed_text = call_stt_api(denoised_audio_path)
+            self.user_input.setText(transcribed_text)
+        except Exception as e:
+            QMessageBox.warning(self, "处理错误", f"音频处理失败: {str(e)}")
+            self.record_btn.setChecked(False)
+
+        try:
+            if os.path.exists(raw_audio_path):
+                os.remove(raw_audio_path)
+            if os.path.exists(denoised_audio_path):
+                os.remove(denoised_audio_path)
+            QMessageBox.information(None, "清理完成", "临时音频文件已删除。")
+        except Exception as e:
+            QMessageBox.critical(
+                None, 
+                "清理错误",  
+                f"清理过程中出现异常: {str(e)}" 
+            )
+    
+    def transcribe_api(self, filename):
+        try:
+            process = subprocess.Popen(
+                ["python", "stt_api_client.py", 
+                 "--mode", "api",
+                 "--audio", filename,
+                 "--api-endpoint", f"{self.config.api_endpoint}"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            stdout, stderr = process.communicate(timeout=20)
+        
+            if process.returncode != 0:
+                err_msg = stderr.decode().strip() or "API请求失败"
+                return f"API错误: {err_msg}"
+            
+            return stdout.decode().strip()
+        
+        except subprocess.TimeoutExpired:
+            process.kill()
+            return "API请求超时"
+        except Exception as e:
+            return f"API调用错误: {str(e)}"
+        
+    def transcribe_audio(self, filename):
+        """根据配置选择转录模式"""
+        if self.config.stt_mode == "local":
+            return self.transcribe_local(filename)
+        else:
+            return self.transcribe_api(filename)
+        
+    def apply_noise_reduction(self, audio_path):
+        """
+        加载音频文件并进行降噪处理。
+        
+        Args:
+            file_path (str): 输入的音频文件路径。
+        
+        Returns:
+            np.ndarray: 降噪后的音频数据。
+        """
+        
+        audio, rate = librosa.load(audio_path, sr=self.sample_rate)
+        epsilon = 1e-8  # 根据实际效果调整
+        audio += epsilon * np.random.randn(len(audio))
+
+        try:
+            # 加载音频文件
+            audio_data, sr = librosa.load(audio_path, sr=self.sample_rate)
+        
+            # 计算背景噪声 (取音频前 1 秒作为噪声样本)
+            noise_sample = audio_data[:sr]
+        
+            # 应用降噪
+            reduced_audio = nr.reduce_noise(
+                y=audio_data, 
+                sr=sr, 
+                y_noise=noise_sample,
+                stationary=False,
+                n_fft=2048,
+                win_length=1024,
+                n_std_thresh=2,
+                verbose=False,
+                n_std_thresh_stationary=1.5 
+            )
+            return reduced_audio
+        except Exception as e:
+            QMessageBox.warning(self, "降噪错误", f"无法完成降噪处理: {str(e)}")
+            return np.zeros(1) 
 
 # ====================== 虚拟环境管理器 ======================
 class VirtualEnvManager:
@@ -642,7 +966,7 @@ class DownloadTask(QThread):
                     "https": self.config.proxy["https"]
                 }
 
-            headers = {"User-Agent": "AI-Toolkit-Pro/1.0"}
+            headers = {"User-Agent": "RIL/1.0"}
             self.response = requests.get(
                 file_url, 
                 stream=True, 
@@ -653,7 +977,10 @@ class DownloadTask(QThread):
             self.response.raise_for_status()
             
             self.total_size = int(self.response.headers.get("content-length", self.total_size))
-            save_path = os.path.join(self.config.model_path, self.file_info["rfilename"])
+            if "stt/" in self.file_info['rfilename']:  # 根据模型类型调整路径
+                save_path = os.path.join(self.config.model_path, "stt", self.file_info["rfilename"])
+            else:
+                save_path = os.path.join(self.config.model_path, self.file_info["rfilename"])
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             
             start_time = time.time()
@@ -948,6 +1275,19 @@ class SettingsPage(QWidget):
         appearance_group.setLayout(appearance_form)
         main_layout.addWidget(appearance_group)
 
+        tts_group = QGroupBox("语音合成设置")
+        tts_layout = QFormLayout()
+        
+        self.tts_check = QCheckBox("启用TTS")
+        self.tts_check.setChecked(self.config.tts_enabled)
+        
+        self.model_type_combo = QComboBox()
+        self.model_type_combo.setCurrentText(self.config.tts_model_type)
+        
+        tts_layout.addRow(self.tts_check)
+        tts_group.setLayout(tts_layout)
+        main_layout.addWidget(tts_group)
+
         btn_layout = QHBoxLayout()
         save_btn = QPushButton("💾 保存设置")
         save_btn.clicked.connect(self.save_settings)
@@ -1035,6 +1375,8 @@ class SettingsPage(QWidget):
         self.config.save_settings()
         self.config_updated.emit()
         QMessageBox.information(self, "成功", "设置已保存")
+        self.config.tts_enabled = self.tts_check.isChecked()
+        self.config.tts_model_type = self.model_type_combo.currentText()
 
     def reset_settings(self):
         default_path = os.path.abspath("models")
@@ -1658,6 +2000,411 @@ class ModelDownloadPage(QWidget):
         dialog.setParent(self.window(), Qt.Dialog)
         dialog.show()
 
+# ====================== 知识库页面类 ======================
+class KnowledgeBasePage(QWidget):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.current_dir = Path(self.config.knowledge_path)
+        self.init_ui()
+        self.load_directory()
+
+    def init_ui(self):
+        main_layout = QVBoxLayout()
+        
+        # 操作按钮栏
+        btn_layout = QHBoxLayout()
+        self.open_btn = QPushButton("打开知识库目录")
+        self.open_btn.clicked.connect(self.open_directory)
+        self.new_folder_btn = QPushButton("新建文件夹")
+        self.new_folder_btn.clicked.connect(self.create_folder)
+        self.upload_btn = QPushButton("上传文件")
+        self.upload_btn.clicked.connect(self.upload_file)
+        
+        btn_layout.addWidget(self.open_btn)
+        btn_layout.addWidget(self.new_folder_btn)
+        btn_layout.addWidget(self.upload_btn)
+        main_layout.addLayout(btn_layout)
+
+        # 文件树形列表
+        self.file_tree = QTreeWidget()
+        self.file_tree.setHeaderLabels(["名称", "类型", "修改时间"])
+        self.file_tree.itemDoubleClicked.connect(self.open_item)
+        main_layout.addWidget(self.file_tree)
+
+        # 预览面板
+        self.preview = QWebEngineView()
+        main_layout.addWidget(self.preview)
+
+        self.setLayout(main_layout)
+
+    def load_directory(self, path=None):
+        """加载目录结构"""
+        self.file_tree.clear()
+        root_path = Path(path) if path else self.current_dir
+        
+        root_item = QTreeWidgetItem(self.file_tree, [root_path.name, "文件夹", ""])
+        root_item.setData(0, Qt.UserRole, root_path)
+        self._populate_tree(root_item, root_path)
+        self.file_tree.expandItem(root_item)
+
+    def _populate_tree(self, parent_item, path):
+        """递归填充树形结构"""
+        try:
+            for entry in path.iterdir():
+                if entry.is_dir():
+                    item = QTreeWidgetItem(parent_item, [entry.name, "文件夹", ""])
+                    item.setData(0, Qt.UserRole, entry)
+                    self._populate_tree(item, entry)
+                else:
+                    mtime = time.strftime("%Y-%m-%d %H:%M", time.localtime(entry.stat().st_mtime))
+                    item = QTreeWidgetItem(parent_item, [entry.name, entry.suffix, mtime])
+                    item.setData(0, Qt.UserRole, entry)
+        except Exception as e:
+            QMessageBox.warning(self, "访问错误", f"无法读取目录: {str(e)}")
+
+    def open_directory(self):
+        """打开知识库目录"""
+        path = QFileDialog.getExistingDirectory(self, "选择知识库目录", str(self.current_dir))
+        if path:
+            self.current_dir = Path(path)
+            self.config.knowledge_path = str(self.current_dir)
+            self.config.save_settings()
+            self.load_directory()
+
+    def create_folder(self):
+        """创建新文件夹"""
+        folder_name, ok = QInputDialog.getText(self, "新建文件夹", "请输入文件夹名称:")
+        if ok and folder_name:
+            new_path = self.current_dir / folder_name
+            try:
+                new_path.mkdir(exist_ok=True)
+                self.load_directory()
+            except Exception as e:
+                QMessageBox.critical(self, "创建失败", f"无法创建文件夹: {str(e)}")
+
+    def upload_file(self):
+        """上传文件"""
+        files, _ = QFileDialog.getOpenFileNames(self, "选择要上传的文件")
+        for file in files:
+            dest = self.current_dir / Path(file).name
+            try:
+                shutil.copy(file, dest)
+            except Exception as e:
+                QMessageBox.warning(self, "上传失败", f"无法上传 {Path(file).name}: {str(e)}")
+        self.load_directory()
+
+    def open_item(self, item):
+        """打开选中的项目"""
+        path = item.data(0, Qt.UserRole)
+        if path.is_dir():
+            self.current_dir = path
+            self.load_directory(path)
+        else:
+            self.preview_file(path)
+
+    def preview_file(self, path):
+        """预览文件内容"""
+        if path.suffix.lower() in [".md", ".txt"]:
+            with open(path, "r", encoding="utf-8") as f:
+                content = markdown.markdown(f.read())
+                self.preview.setHtml(content)
+        elif path.suffix.lower() in [".pdf"]:
+            self.preview.setUrl(QUrl.fromLocalFile(str(path)))
+        else:
+            QMessageBox.information(self, "预览提示", "暂不支持此文件类型的预览")
+
+#===================== 语音转文本页面 ======================
+class STTPage(QWidget):
+    def __init__(self, config, download_manager):
+        super().__init__()
+        self.config = config
+        self.download_manager = download_manager
+        self.init_ui()
+        
+    def init_ui(self):
+        layout = QVBoxLayout()
+        
+        # 模型控制栏
+        control_layout = QHBoxLayout()
+        self.model_combo = QComboBox()
+        self.gpu_check = QCheckBox("GPU加速")
+        self.load_btn = QPushButton("加载模型")
+        self.load_btn.clicked.connect(self.load_model)
+        
+        control_layout.addWidget(QLabel("选择模型:"))
+        control_layout.addWidget(self.model_combo)
+        control_layout.addWidget(self.gpu_check)
+        control_layout.addWidget(self.load_btn)
+        layout.addLayout(control_layout)
+        
+        # 日志显示
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        layout.addWidget(self.log_view)
+        
+        self.setLayout(layout)
+        self.scan_models()
+        
+    def scan_models(self):
+        self.model_combo.clear()
+        model_dir = Path(self.config.model_path) / 'stt'
+        if model_dir.exists():
+            for model in model_dir.glob("*"):
+                if model.is_dir() and (model / "model.bin").exists():
+                    self.model_combo.addItem(model.name)
+
+    def load_model(self):
+        model_name = self.model_combo.currentText()
+        use_gpu = self.gpu_check.isChecked()
+        model_path = Path(self.config.model_path) / "stt" / model_name
+        
+        process = QProcess()
+        process.setProgram(sys.executable)
+        process.setArguments([
+            "stt_api.py",
+            "--model_path", str(model_path),
+            "--use_gpu" if use_gpu else "--use_cpu"
+        ])
+        
+        process.readyReadStandardOutput.connect(
+            lambda: self.log_view.appendPlainText(process.readAllStandardOutput().data().decode()))
+        process.readyReadStandardError.connect(
+            lambda: self.log_view.appendPlainText(process.readAllStandardError().data().decode()))
+            
+        process.start()
+
+# ====================== TTS 类 ======================
+class TTSPage(QWidget):
+    status_signal = pyqtSignal(str)
+    
+    def __init__(self, config=None):
+        super().__init__()
+        self.config = config
+        self.tts_enabled = False  # TTS 功能是否开启
+        self.cache_dir = Path("./cache")
+        self.cache_dir.mkdir(exist_ok=True)
+        # 模型和音频都存放在 ./models/tts 下
+        self.models_dir = Path("./models/tts")
+        self.models_dir.mkdir(parents=True, exist_ok=True)
+        # 用于启动 tts.py 的进程句柄
+        self.tts_process = None
+        self.init_ui()
+        self.status_signal.connect(self.update_status)
+
+    def init_ui(self):
+        main_layout = QVBoxLayout()
+        
+        # TTS 功能开关
+        self.tts_toggle = QCheckBox("启用 TTS 功能")
+        self.tts_toggle.stateChanged.connect(self.toggle_tts)
+        main_layout.addWidget(self.tts_toggle)
+
+        # 模型管理部分
+        model_group = QGroupBox("XTTS 模型管理")
+        model_layout = QVBoxLayout()
+        
+        # 下载模型按钮
+        self.download_model_btn = QPushButton("下载 XTTS-v2 模型")
+        self.download_model_btn.clicked.connect(self.download_model)
+        model_layout.addWidget(self.download_model_btn)
+        
+        # 模型选择下拉菜单
+        model_select_layout = QHBoxLayout()
+        model_select_layout.addWidget(QLabel("选择模型:"))
+        self.model_combo = QComboBox()
+        model_select_layout.addWidget(self.model_combo)
+        model_layout.addLayout(model_select_layout)
+        
+        # 启动 TTS 服务按钮
+        self.load_model_btn = QPushButton("启动 TTS 服务")
+        self.load_model_btn.clicked.connect(self.load_model)
+        model_layout.addWidget(self.load_model_btn)
+        
+        # 停止 TTS 服务按钮
+        self.stop_service_btn = QPushButton("停止 TTS 服务")
+        self.stop_service_btn.clicked.connect(self.stop_tts_service)
+        self.stop_service_btn.setEnabled(False)
+        model_layout.addWidget(self.stop_service_btn)
+        
+        # GPU 加速选项
+        self.gpu_check = QCheckBox("启用 GPU 加速")
+        self.gpu_check.setChecked(True)
+        model_layout.addWidget(self.gpu_check)
+        
+        model_group.setLayout(model_layout)
+        main_layout.addWidget(model_group)
+
+        # 音频选择部分
+        audio_group = QGroupBox("参考音频选择")
+        audio_layout = QVBoxLayout()
+        
+        self.audio_combo = QComboBox()
+        self.refresh_audio_btn = QPushButton("刷新音频列表")
+        self.refresh_audio_btn.clicked.connect(self.load_audio_files)
+        
+        audio_layout.addWidget(QLabel("选择参考音频:"))
+        audio_layout.addWidget(self.audio_combo)
+        audio_layout.addWidget(self.refresh_audio_btn)
+        audio_group.setLayout(audio_layout)
+        main_layout.addWidget(audio_group)
+
+        # 状态显示
+        self.status_label = QLabel("状态: TTS 功能未启用")
+        main_layout.addWidget(self.status_label)
+
+        # 日志显示
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        main_layout.addWidget(self.log_view)
+
+        self.setLayout(main_layout)
+        
+        # 刷新一次模型和音频列表
+        self.refresh_model_list()
+        self.load_audio_files()
+
+    def toggle_tts(self, state):
+        """切换 TTS 功能开关"""
+        self.tts_enabled = state == Qt.Checked
+        if self.tts_enabled:
+            self.status_signal.emit("状态: TTS 功能已启用")
+            self.log("TTS 功能已启用")
+        else:
+            self.status_signal.emit("状态: TTS 功能未启用")
+            self.log("TTS 功能已禁用")
+
+    def download_model(self):
+        """通过 git 下载 XTTS-v2 模型到指定目录下一个文件夹中"""
+        # 假设目标模型文件夹名称为 "XTTS-v2"
+        target_model_folder = self.models_dir / "XTTS-v2"
+        if target_model_folder.exists():
+            self.log("模型文件夹 'XTTS-v2' 已存在，无需重复下载")
+            return
+
+        try:
+            self.log("正在下载 XTTS-v2 模型...")
+            # 使用 git 克隆模型仓库到 target_model_folder
+            subprocess.run(["git", "clone", "https://huggingface.co/coqui/XTTS-v2", str(target_model_folder)], check=True)
+            self.status_signal.emit("状态: 模型下载成功")
+            self.log("XTTS-v2 模型下载成功")
+            # 刷新模型列表
+            self.refresh_model_list()
+        except Exception as e:
+            self.status_signal.emit("状态: 模型下载失败")
+            self.log(f"模型下载错误: {str(e)}")
+
+    def refresh_model_list(self):
+        """刷新模型选择下拉菜单，显示 models/tts 中的文件夹"""
+        self.model_combo.clear()
+        for item in self.models_dir.iterdir():
+            if item.is_dir():
+                self.model_combo.addItem(item.name, str(item))
+        if self.model_combo.count() == 0:
+            self.log("未发现任何模型文件夹，请先下载模型。")
+
+    def load_audio_files(self):
+        """从 models/tts 目录加载音频文件（文件后缀为 .wav 或 .mp3）"""
+        self.audio_combo.clear()
+        audio_files = []
+        for f in self.models_dir.glob("*"):
+            if f.is_file() and f.suffix.lower() in ('.wav', '.mp3'):
+                audio_files.append(f)
+        for f in audio_files:
+            self.audio_combo.addItem(f.name, str(f))
+        if not audio_files:
+            self.log("未找到任何音频文件，请确保模型目录中包含参考音频。")
+
+    def load_model(self):
+        """启动 TTS 服务，通过运行 tts.py 脚本，并显示日志信息"""
+        if not self.tts_enabled:
+            self.log("错误：请先启用 TTS 功能")
+            return
+
+        # 选择的模型文件夹
+        model_folder = self.model_combo.currentData()
+        if not model_folder or not Path(model_folder).exists():
+            self.log("错误：未选择有效的模型文件夹")
+            return
+
+        # 选择的参考音频
+        ref_audio = self.audio_combo.currentData()
+        if not ref_audio or not Path(ref_audio).exists():
+            self.log("错误：未选择有效的参考音频")
+            return
+
+        try:
+            self.log("正在启动 TTS 服务...")
+            # 构造参数列表，传入模型文件夹、参考音频、语言及 GPU 参数
+            if platform.system() == "Windows":
+                venv_python = str(Path("./venv/Scripts/python.exe").resolve())
+            else:
+                venv_python = str(Path("./venv/bin/python").resolve())
+
+            command = [venv_python, "tts.py",
+                       "--model_folder", model_folder,
+                       "--audio_path", ref_audio,
+                       "--language", "en"]
+            if self.gpu_check.isChecked():
+                command.append("--gpu")
+            self.log(f"启动命令: {' '.join(command)}")
+            # 使用 QProcess 启动 tts.py，并连接输出信号
+            self.tts_process = QProcess(self)
+            self.tts_process.readyReadStandardOutput.connect(self.handle_stdout)
+            self.tts_process.readyReadStandardError.connect(self.handle_stderr)
+            self.tts_process.started.connect(lambda: self.log("TTS 服务进程已启动"))
+            self.tts_process.finished.connect(self.tts_finished)
+            self.tts_process.start(command[0], command[1:])
+            self.status_signal.emit("状态: TTS 服务已启动")
+            self.stop_service_btn.setEnabled(True)
+        except Exception as e:
+            self.status_signal.emit("状态: TTS 服务启动失败")
+            self.log(f"TTS 服务启动错误: {str(e)}")
+
+    def stop_tts_service(self):
+        """停止正在运行的 TTS 服务"""
+        if self.tts_process and self.tts_process.state() != QProcess.NotRunning:
+            self.log("正在停止 TTS 服务...")
+            self.tts_process.terminate()
+            # 如若进程未能及时结束，可调用 kill()
+            if not self.tts_process.waitForFinished(3000):
+                self.tts_process.kill()
+            self.log("TTS 服务已停止")
+            self.status_signal.emit("状态: TTS 服务已停止")
+            self.stop_service_btn.setEnabled(False)
+        else:
+            self.log("TTS 服务未在运行。")
+
+    def handle_stdout(self):
+        """处理 tts.py 标准输出信息"""
+        if self.tts_process:
+            data = self.tts_process.readAllStandardOutput()
+            stdout = bytes(data).decode("utf8")
+            self.log(stdout.strip())
+
+    def handle_stderr(self):
+        """处理 tts.py 错误输出信息"""
+        if self.tts_process:
+            data = self.tts_process.readAllStandardError()
+            stderr = bytes(data).decode("utf8")
+            self.log(stderr.strip())
+
+    def tts_finished(self):
+        """TTS 服务进程结束时的处理"""
+        self.log("TTS 服务进程已退出")
+        self.status_signal.emit("状态: TTS 服务已停止")
+        self.stop_service_btn.setEnabled(False)
+        self.tts_process = None
+
+    def log(self, message):
+        """记录日志，追加到日志显示区域"""
+        timestamp = time.strftime('%H:%M:%S')
+        self.log_view.appendPlainText(f"[{timestamp}] {message}")
+
+    def update_status(self, text):
+        """更新状态栏"""
+        self.status_label.setText(text)
+
 # ====================== 主窗口 ======================
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -1671,9 +2418,13 @@ class MainWindow(QMainWindow):
         VirtualEnvManager.get_python_path()
         self.config = ConfigManager.instance()
         self.download_manager = DownloadManager(self.config)
+        self.knowledge_page = KnowledgeBasePage(self.config)
+        self.stt_page = STTPage(self.config, self.download_manager)
+        self.tts_page = TTSPage(self.config)
+        self.chat_tts_pagepage = self.tts_page
         self.init_ui()
         self.setWindowTitle("RIL")
-        self.setGeometry(100, 100, 1000, 600)  # 调整初始窗口大小
+        self.setGeometry(100, 100, 1000, 600) 
         self.apply_theme()
         self.settings_page.config_updated.connect(self.on_config_updated)
         self.setWindowIcon(QIcon("./assets/icons/placeholder.png"))
@@ -1690,7 +2441,6 @@ class MainWindow(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # 自定义标题栏
         self.title_bar = QWidget()
         self.title_bar.setFixedHeight(35)
         self.title_bar.setMouseTracking(True)
@@ -1718,7 +2468,6 @@ class MainWindow(QMainWindow):
         title_bar_layout.addWidget(self.max_btn)
         title_bar_layout.addWidget(self.close_btn)
 
-        # 主内容区域
         content_widget = QWidget()
         content_layout = QHBoxLayout(content_widget)
         content_layout.setContentsMargins(0, 0, 0, 0)
@@ -1730,19 +2479,28 @@ class MainWindow(QMainWindow):
 
         self.stacked_widget = QStackedWidget()
 
+        self.toggle_btn = QPushButton("☰")
+        self.toggle_btn.setFixedSize(30, 30)
+        self.toggle_btn.clicked.connect(self.toggle_sidebar)
+        title_bar_layout.insertWidget(0, self.toggle_btn)
+
         self.home_page = HomePage(self.config)
         self.model_page = ModelDownloadPage(self.config, self.download_manager)
         self.settings_page = SettingsPage(self.config)
         self.download_page = DownloadPage(self.download_manager)
         self.command_line_page = CommandLinePage(self.config)
-        self.chat_page = ChatPage(self.config)  # 新增对话页面
+        self.chat_page = ChatPage(self.config) 
+        self.tts_page = TTSPage(self.config)
         
         self.add_module("🏠 首页", self.home_page)
-        self.add_module("💬 模型对话", self.chat_page)  # 新增对话选项
+        self.add_module("💬 模型对话", self.chat_page) 
         self.add_module("🏗️ 模型中心", self.model_page)
         self.add_module("⚙️ 系统设置", self.settings_page)
         self.add_module("⬇️ 下载管理", self.download_page)
         self.add_module("💻 命令行终端", self.command_line_page)
+        self.add_module("📚 知识库", self.knowledge_page)
+        self.add_module("🎤 STT", self.stt_page)
+        self.add_module("🔊 TTS", self.tts_page)
         
         self.nav_list.currentRowChanged.connect(self.stacked_widget.setCurrentIndex)
         
@@ -1760,8 +2518,7 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(main_widget)
         self.update_status()
-        
-        # 添加窗口边缘调整控件
+
         self.size_grips = [
             SizeGrip(self, Qt.LeftEdge | Qt.TopEdge),
             SizeGrip(self, Qt.RightEdge | Qt.TopEdge),
@@ -1895,6 +2652,19 @@ class MainWindow(QMainWindow):
         self.theme_status.setText(f"主题: {theme}")
         self.proxy_status.setText(f"代理: {proxy}")
 
+    def toggle_sidebar(self):
+        if self.nav_list.width() > 50:
+            self.nav_list.setFixedWidth(50)
+            for i in range(self.nav_list.count()):
+                item = self.nav_list.item(i)
+                item.setText("")
+        else:
+            self.nav_list.setFixedWidth(200)
+            texts = ["🏠", "💬", "🏗️", "⚙️", "⬇️", "💻", "🎤", "🔊"]  # 原文本简化为图标
+            for i in range(self.nav_list.count()):
+                item = self.nav_list.item(i)
+                item.setText(texts[i])
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
@@ -2026,11 +2796,12 @@ class SizeGrip(QWidget):
             self.setCursor(Qt.ArrowCursor)
 
     def paintEvent(self, event):
-        pass  # 无需绘制内容，仅用于交互
+        pass 
 
 # ====================== 程序入口 ======================
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    create_models_folders()
     app.setWindowIcon(QIcon(APP_ICON_PATH)) 
     app.setStyle("Fusion")
     window = MainWindow()

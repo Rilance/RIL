@@ -34,7 +34,7 @@ pip install -r requirements.txt
 ```bash
 python app-zh.py
 ```
-## FAQ
+## 常见问题
 
 1. Q: Failed to install flash-attn
 A: Ensure PyTorch and CUDA are installed. Visit[flash-attention github](https://github.com/bdashore3/flash-attention/releases/) to download the appropriate version, then install manually via pip. For example:

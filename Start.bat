@@ -1,2 +1,2 @@
-venv\Scripts\python.exe app-zh.py
+venv\Scripts\python.exe main3.py
 pause
