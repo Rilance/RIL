@@ -9,7 +9,10 @@ import sqlite3
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 import platform
+import langdetect
+from langdetect import detect
 from pathlib import Path
+import re
 
 import markdown
 import requests
@@ -134,7 +137,7 @@ class ConfigManager:
         self.font_size = 12
         self.stt_mode = "api"
         self.api_endpoint = "http://127.0.0.1:8000/transcribe" 
-        self.tts_enabled = self.settings.value("tts_enabled", False, type=bool)
+        self.tts_enabled = self.settings.value("tts_enabled", True, type=bool)
         self.tts_model_type = self.settings.value("tts_model_type", "SoVITS", type=str)
         self.sovits_path = os.path.abspath("./SoVITS_weights")
         self.gpt_path = os.path.abspath("./GPT_weights")
@@ -160,7 +163,7 @@ class ConfigManager:
         self.font_size = self.settings.value("font_size", 12, type=int)
         self.stt_mode = self.settings.value("stt_mode", "api")
         self.api_endpoint = self.settings.value("api_endpoint", "http://127.0.0.1:8000/transcribe")
-        self.tts_enabled = self.settings.value("tts_enabled", False, type=bool)
+        self.tts_enabled = self.settings.value("tts_enabled", True, type=bool)
         self.tts_model_type = self.settings.value("tts_model_type", "SoVITS")
         self.knowledge_path = self.settings.value("knowledge_path", self.knowledge_path)  # 新增
 
@@ -225,6 +228,7 @@ class ChatPage(QWidget):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        self.tts_enabled = getattr(config, "tts_enabled", False)
         self.model_process = None  # 模型加载进程
         self.record_btn = None
         self.init_ui()
@@ -235,6 +239,7 @@ class ChatPage(QWidget):
         self.current_message = ""
         self.is_recording = False
         self.tts_page = None
+        self.tts_conversion_process = None 
 
         self.stream = None  # 显式初始化
         self.audio_frames = []
@@ -417,6 +422,42 @@ class ChatPage(QWidget):
             self.append_message("[系统] 模型已就绪，可以开始对话", is_system=True)
             self.model_process.readyReadStandardOutput.disconnect(self.handle_initial_output)
 
+    def query_knowledge_base(self, question):
+        """
+        扫描知识库目录中所有 .txt 和 .md 文件，
+        对文件内容进行简单关键字匹配（基于用户问题中的单词），
+        返回匹配到的相关内容摘要（多个文件摘要之间以分隔线分开）。
+        """
+        kb_path = Path(self.config.knowledge_path)
+        if not kb_path.exists():
+            return ""
+        
+        # 将问题转换为小写并拆分成单词（过滤掉非字母字符）
+        question_words = set(re.findall(r'\w+', question.lower()))
+        relevant_texts = []
+        
+        # 遍历知识库目录下的所有文件（递归）
+        for file in kb_path.rglob("*"):
+            if file.suffix.lower() in [".txt", ".md"]:
+                try:
+                    content = file.read_text(encoding="utf-8")
+                except Exception:
+                    continue
+                content_lower = content.lower()
+                # 简单评分：统计每个关键词在内容中出现的次数之和
+                score = sum(content_lower.count(word) for word in question_words)
+                if score > 0:
+                    # 提取文件摘要，这里取前300个字符作为摘要（可根据实际需要调整）
+                    snippet = content[:300].strip()
+                    summary = f"【{file.name}】摘要：\n{snippet}"
+                    relevant_texts.append(summary)
+        
+        if relevant_texts:
+            # 将多个摘要用分隔线拼接起来
+            return "\n\n---\n\n".join(relevant_texts)
+        else:
+            return ""
+
     def send_message(self):
         if not self.model_process or self.model_process.state() != QProcess.Running:
             QMessageBox.warning(self, "错误", "请先加载模型")
@@ -425,28 +466,83 @@ class ChatPage(QWidget):
         question = self.user_input.text().strip()
         if not question:
             return
+        
+        # 查询知识库
+        knowledge_context = self.query_knowledge_base(question)
+        if knowledge_context:
+            # 将知识库内容与用户问题组合
+            combined_question = (
+                f"以下是与问题相关的知识库内容：\n{knowledge_context}\n\n"
+                f"请基于以上信息回答用户问题：\n{question}"
+            )
+        else:
+            combined_question = question
 
-        self.model_process.write(f"{question}\n".encode())
+        # 将用户原始问题显示在对话窗口中
         self.append_message(f"{self.user_prefix}{question}")
+        # 清空输入框
         self.user_input.clear()
+        # 将组合后的问题写入到 LLM 进程中
+        self.model_process.write(f"{combined_question}\n".encode())
 
-        # 假设模型会回复一条消息，这里需要从模型的输出中读取回复
-        # 这里假设模型的回复是通过标准输出返回的
+        # 等待 LLM 回复
         self.model_process.waitForReadyRead()
         response = self.model_process.readAllStandardOutput().data().decode().strip()
         if response:
             self.append_message(f"{self.model_prefix}{response}")
             self.chat_history_data.append({"role": "model", "content": response})
+            if self.config.tts_enabled:
+                self.generate_tts_file(response)
 
-            if self.tts_page and self.tts_page.tts_enabled:
-                self.tts_page.generate_tts(response)
+    def generate_tts_file(self, text):
+        """
+        通过 TTS FastAPI 接口生成语音文件。自动检测输入文本语言，
+        将文本和检测到的语言代码提交给 TTS 服务（假设服务地址为 http://localhost:8000/tts），
+        服务端会将生成的音频文件保存到 ./audio/tts_output.wav，每次生成时覆盖之前的文件。
+        """
+        try:
+            detected_lang = detect(text)
+            self.log(f"检测到语言: {detected_lang}")
+        except Exception as e:
+            self.log(f"语言检测失败: {e}，默认使用 'en'")
+            detected_lang = "en"
+    
+        payload = {"text": text, "language": detected_lang}
+        url = "http://127.0.0.1:8010/tts"
+        self.log(f"调用 TTS API：POST {url}，参数: {payload}")
+    
+        try:
+            response = requests.post(url, json=payload, timeout=30)
+            self.log(f"TTS API 响应状态: {response.status_code}")
+            if response.status_code == 200:
+                data = response.json()
+                output_file = data.get("output_file", "未知")
+                self.log(f"TTS 转换成功，文件已保存至: {output_file}")
+            else:
+                self.log(f"TTS API 调用失败，状态码: {response.status_code}，错误信息: {response.text}")
+        except Exception as e:
+            self.log(f"调用 TTS API 时发生异常: {e}")
+    
+    def convert_markdown_to_html(self, markdown_text):
+        """将 Markdown 文本转换为 HTML"""
+        html = markdown.markdown(markdown_text)
+        return html
 
     def append_message(self, message):
+        # 获取当前对话历史的所有行，并取最后一行（如果存在）
+        current_lines = self.chat_history.toPlainText().strip().splitlines()
+        if current_lines and current_lines[-1].strip() == message.strip():
+            # 如果最后一行与即将追加的消息完全相同，则不重复追加
+            return
+    
+        # 将消息追加到对话历史中
         self.chat_history.appendPlainText(message)
+        
+        # 如果消息以用户前缀开头，则将其记录到对话历史数据中
         if message.startswith(self.user_prefix):
-            question = message[len(self.user_prefix):]
+            question = message[len(self.user_prefix):].strip()
             self.chat_history_data.append({"role": "user", "content": question})
-
+    
     def export_chat_history(self):
         history_folder = Path("./history")
         history_folder.mkdir(parents=True, exist_ok=True)
@@ -500,6 +596,10 @@ class ChatPage(QWidget):
         cursor = self.chat_history.textCursor()
         cursor.movePosition(QTextCursor.End)
         
+        if message.startswith(self.model_prefix):
+            # 只对模型的消息进行 Markdown 处理
+            message = self.convert_markdown_to_html(message[len(self.model_prefix):])
+
         if is_system:  
             cursor.insertHtml(f'<span style="color:#666;">{message}</span><br>')
         else:
@@ -510,9 +610,10 @@ class ChatPage(QWidget):
             # 模型消息处理
             elif message.startswith(model_prefix):
                 clean_msg = message[len(model_prefix):].lstrip()
-                cursor.insertText(f"{model_prefix}{clean_msg}\n")
+                html_content = markdown.markdown(clean_msg)
+                cursor.insertHtml(f'{self.model_prefix}{html_content}<br>')
             else:  # 未知类型默认处理
-                cursor.insertText(f"{message}\n")
+                cursor.insertHtml(f'{message}<br>')
         
         # 自动滚动
         self.chat_history.ensureCursorVisible()
@@ -980,7 +1081,7 @@ class DownloadTask(QThread):
             if "stt/" in self.file_info['rfilename']:  # 根据模型类型调整路径
                 save_path = os.path.join(self.config.model_path, "stt", self.file_info["rfilename"])
             else:
-                save_path = os.path.join(self.config.model_path, self.file_info["rfilename"])
+                save_path = os.path.join(self.config.model_path, "llm", self.file_info["rfilename"])
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             
             start_time = time.time()
@@ -1059,7 +1160,7 @@ class DownloadTask(QThread):
             except Exception as e:
                 print(f"关闭连接时出错: {e}")
         
-        save_path = os.path.join(self.config.model_path, self.file_info["rfilename"])
+        save_path = os.path.join(self.config.model_path, "llm", self.file_info["rfilename"])
         if not os.path.exists(save_path):
             return
 
@@ -1093,7 +1194,7 @@ class DownloadManager(QObject):
         if len(self.active_tasks) >= MAX_CONCURRENT:
             return None
         
-        save_path = os.path.join(self.config.model_path, file_info["rfilename"])
+        save_path = os.path.join(self.config.model_path, "llm", self.file_info["rfilename"])
         if os.path.exists(save_path):
             return None
         
@@ -1647,7 +1748,7 @@ class ModelDetailDialog(QDialog):
 
     def git_download(self):
         model_url = f"https://huggingface.co/{self.model_id}"
-        save_path = os.path.join(self.config.model_path, self.model_id.split('/')[-1])
+        save_path = os.path.join(self.config.model_path, "llm", self.model_id.split('/')[-1])
     
         if os.path.exists(save_path):
             QMessageBox.warning(self, "警告", "模型目录已存在！")
@@ -2120,6 +2221,8 @@ class STTPage(QWidget):
         super().__init__()
         self.config = config
         self.download_manager = download_manager
+        self.git_process = None      # 用于管理 git 克隆操作的 QProcess
+        self.stt_process = None      # 用于管理 STT API 服务的 QProcess
         self.init_ui()
         
     def init_ui(self):
@@ -2138,6 +2241,16 @@ class STTPage(QWidget):
         control_layout.addWidget(self.load_btn)
         layout.addLayout(control_layout)
         
+        # 附加功能按钮：下载模型和停止服务
+        extra_control_layout = QHBoxLayout()
+        self.download_btn = QPushButton("下载 Faster Whisper Large V3")
+        self.download_btn.clicked.connect(self.download_faster_whisper_model)
+        self.stop_service_btn = QPushButton("停止 STT 服务")
+        self.stop_service_btn.clicked.connect(self.stop_stt_service)
+        extra_control_layout.addWidget(self.download_btn)
+        extra_control_layout.addWidget(self.stop_service_btn)
+        layout.addLayout(extra_control_layout)
+        
         # 日志显示
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
@@ -2147,32 +2260,98 @@ class STTPage(QWidget):
         self.scan_models()
         
     def scan_models(self):
+        """扫描配置中的 stt 目录，查找包含 model.bin 的模型文件夹"""
         self.model_combo.clear()
         model_dir = Path(self.config.model_path) / 'stt'
         if model_dir.exists():
             for model in model_dir.glob("*"):
                 if model.is_dir() and (model / "model.bin").exists():
                     self.model_combo.addItem(model.name)
-
+    
     def load_model(self):
+        """加载选择的 STT 模型，启动 stt_api.py 服务"""
         model_name = self.model_combo.currentText()
+        if not model_name:
+            QMessageBox.warning(self, "警告", "请先选择一个模型！")
+            return
         use_gpu = self.gpu_check.isChecked()
         model_path = Path(self.config.model_path) / "stt" / model_name
         
-        process = QProcess()
-        process.setProgram(sys.executable)
-        process.setArguments([
-            "stt_api.py",
-            "--model_path", str(model_path),
-            "--use_gpu" if use_gpu else "--use_cpu"
-        ])
+        self.stt_process = QProcess(self)
+        self.stt_process.setProgram(sys.executable)
+        # 构造命令参数：stt_api.py --model_path <model_path> --use_gpu 或 --use_cpu
+        args = ["stt_api.py", "--model_path", str(model_path)]
+        if use_gpu:
+            args.append("--use_gpu")
+        else:
+            args.append("--use_cpu")
+        self.stt_process.setArguments(args)
         
-        process.readyReadStandardOutput.connect(
-            lambda: self.log_view.appendPlainText(process.readAllStandardOutput().data().decode()))
-        process.readyReadStandardError.connect(
-            lambda: self.log_view.appendPlainText(process.readAllStandardError().data().decode()))
-            
-        process.start()
+        self.stt_process.readyReadStandardOutput.connect(self.handle_stt_stdout)
+        self.stt_process.readyReadStandardError.connect(self.handle_stt_stderr)
+        self.stt_process.start()
+        self.log("STT 服务启动中...")
+    
+    def handle_stt_stdout(self):
+        output = self.stt_process.readAllStandardOutput().data().decode()
+        self.log(output)
+    
+    def handle_stt_stderr(self):
+        error_output = self.stt_process.readAllStandardError().data().decode()
+        self.log(error_output)
+    
+    def download_faster_whisper_model(self):
+        """
+        通过 git 下载模型仓库：https://huggingface.co/Systran/faster-whisper-large-v3，
+        下载到 {config.model_path}/stt/faster-whisper-large-v3
+        """
+        model_url = "https://huggingface.co/Systran/faster-whisper-large-v3"
+        dest_dir = os.path.join(self.config.model_path, "stt", "faster-whisper-large-v3")
+        if os.path.exists(dest_dir):
+            QMessageBox.information(self, "提示", "Faster Whisper Large V3 模型已存在。")
+            return
+        
+        os.makedirs(os.path.dirname(dest_dir), exist_ok=True)
+        self.git_process = QProcess(self)
+        self.git_process.readyReadStandardOutput.connect(self.handle_git_output)
+        self.git_process.readyReadStandardError.connect(self.handle_git_error)
+        self.git_process.finished.connect(self.handle_git_finished)
+        
+        command = "git"
+        args = ["clone", "--progress", model_url, dest_dir]
+        self.log(f"执行命令: {command} {' '.join(args)}")
+        self.git_process.start(command, args)
+    
+    def handle_git_output(self):
+        output = self.git_process.readAllStandardOutput().data().decode()
+        self.log("Git输出: " + output)
+    
+    def handle_git_error(self):
+        error_output = self.git_process.readAllStandardError().data().decode()
+        self.log("Git错误: " + error_output)
+    
+    def handle_git_finished(self, exitCode, exitStatus):
+        if exitCode == 0:
+            QMessageBox.information(self, "提示", "Faster Whisper Large V3 模型下载完成。")
+        else:
+            QMessageBox.critical(self, "错误", f"下载失败，退出码：{exitCode}")
+        self.git_process = None
+    
+    def stop_stt_service(self):
+        """停止 STT API 服务"""
+        if self.stt_process and self.stt_process.state() == QProcess.Running:
+            self.stt_process.terminate()
+            if self.stt_process.waitForFinished(5000):
+                QMessageBox.information(self, "提示", "STT 服务已停止。")
+            else:
+                QMessageBox.warning(self, "提示", "停止 STT 服务超时。")
+            self.stt_process = None
+        else:
+            QMessageBox.information(self, "提示", "STT 服务未运行。")
+
+    def log(self, message):
+        """将消息追加到日志窗口"""
+        self.log_view.appendPlainText(message)
 
 # ====================== TTS 类 ======================
 class TTSPage(QWidget):
@@ -2342,9 +2521,8 @@ class TTSPage(QWidget):
                 venv_python = str(Path("./venv/bin/python").resolve())
 
             command = [venv_python, "tts.py",
-                       "--model_folder", model_folder,
-                       "--audio_path", ref_audio,
-                       "--language", "en"]
+                       "--model", model_folder,
+                       "--audio_path", ref_audio]
             if self.gpu_check.isChecked():
                 command.append("--gpu")
             self.log(f"启动命令: {' '.join(command)}")
